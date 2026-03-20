@@ -1,1 +1,5 @@
 project_id = "hrtonntmqbuewtqqfbkp"
+
+# Local Supabase (supabase start) — hosted project uses Dashboard or SQL migration instead.
+[auth.email]
+enable_confirmations = false

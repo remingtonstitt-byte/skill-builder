@@ -9,6 +9,19 @@ Sign-in uses [Supabase Auth](https://supabase.com/docs/guides/auth) (`signUp` / 
 1. **Authentication → Providers** → **Email**: enable it. Turn **off** **“Confirm email”** / **“Confirm sign up”** (wording varies; you want sign-ups to get a session immediately). If it stays on, new users can look “created” but password sign-in fails until they confirm — delete test users under **Authentication → Users** after changing this. You can turn off **Google** if you no longer use it.
 2. **Authentication → URL configuration**: set **Site URL** to your production origin. For local dev, add `http://localhost:5173` (or your Vite port) under **Redirect URLs**.
 
+### Fix: sign-up works but sign-in says wrong password / invalid login
+
+Supabase is often still requiring **email confirmation** even if the toggle looks off.
+
+**Option A — Run the SQL migration (most reliable)**  
+1. Supabase **Dashboard** → your project → **SQL Editor** → New query.  
+2. Paste the entire file [`supabase/migrations/20260321180000_auto_confirm_email_on_signup.sql`](supabase/migrations/20260321180000_auto_confirm_email_on_signup.sql) and click **Run**.  
+3. **Authentication** → **Users** → delete old test users for that email.  
+4. Sign up again on the app; you should be able to sign in with the same password.
+
+**Option B — Dashboard only**  
+**Authentication** → **Providers** → **Email** → disable **Confirm email** / **email confirmations**, then delete users and sign up again.
+
 Environment variables (optional; see `.env.example`):
 
 - `VITE_SUPABASE_URL`
