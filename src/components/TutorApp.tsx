@@ -263,7 +263,7 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
   rewriteInstruction: string;
   onRewriteChange: (v: string) => void;
 }) {
-  const { user, signOut } = useAuth();
+  const { user, isGuest, signOut } = useAuth();
   const [showOcr, setShowOcr] = useState(false);
 
   return (
@@ -307,11 +307,18 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
         </Button>
       </div>
 
-      {user && (
-        <div className="mt-8 flex items-center gap-2">
-          <span className="text-sm text-muted-foreground">{user.email}</span>
-          <Button onClick={signOut} variant="ghost" size="sm" className="text-muted-foreground">
-            <LogOut className="w-3 h-3 mr-1" /> Sign out
+      {(user || isGuest) && (
+        <div className="mt-8 flex flex-col items-center gap-2 sm:flex-row sm:gap-3">
+          <div className="text-center sm:text-left">
+            <span className="text-sm text-muted-foreground">{user?.email ?? "Guest"}</span>
+            {isGuest && !user && (
+              <p className="text-xs text-muted-foreground/90 max-w-xs">
+                No account on this device — tutor features work; nothing is tied to a login.
+              </p>
+            )}
+          </div>
+          <Button onClick={signOut} variant="ghost" size="sm" className="text-muted-foreground shrink-0">
+            <LogOut className="w-3 h-3 mr-1" /> {isGuest && !user ? "Leave" : "Sign out"}
           </Button>
         </div>
       )}

@@ -1,13 +1,17 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import type { AuthError, User, Session } from "@supabase/supabase-js";
 
 export type AuthResult = { error: null } | { error: AuthError };
 
+const GUEST_SESSION_KEY = "skill-builder-guest";
+
 interface AuthContextType {
   user: User | null;
   session: Session | null;
   loading: boolean;
+  isGuest: boolean;
+  enterAsGuest: () => void;
   signIn: (email: string, password: string) => Promise<AuthResult>;
   signUp: (email: string, password: string) => Promise<AuthResult>;
   signOut: () => Promise<void>;
@@ -15,11 +19,27 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+function readGuestFlag(): boolean {
+  try {
+    return sessionStorage.getItem(GUEST_SESSION_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setGuestFlag(on: boolean) {
+  try {
+    if (on) sessionStorage.setItem(GUEST_SESSION_KEY, "1");
+    else sessionStorage.removeItem(GUEST_SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 function normalizeEmail(email: string): string {
   return email.trim();
 }
 
-/** Plain Error shaped for our UI; avoids relying on AuthError constructor across bundler versions. */
 function authMessage(message: string, code?: string): AuthError {
   const err = new Error(message) as AuthError;
   err.name = "AuthError";
@@ -36,12 +56,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isGuest, setIsGuest] = useState(readGuestFlag);
+
+  const clearGuestMode = useCallback(() => {
+    setGuestFlag(false);
+    setIsGuest(false);
+  }, []);
+
+  const enterAsGuest = () => {
+    setGuestFlag(true);
+    setIsGuest(true);
+  };
 
   useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, session) => {
         setSession(session);
         setUser(session?.user ?? null);
+        if (session?.user) {
+          clearGuestMode();
+        }
         setLoading(false);
       }
     );
@@ -49,11 +83,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       setUser(session?.user ?? null);
+      if (session?.user) {
+        clearGuestMode();
+      }
       setLoading(false);
     });
 
     return () => subscription.unsubscribe();
-  }, []);
+  }, [clearGuestMode]);
 
   const signIn = async (email: string, password: string): Promise<AuthResult> => {
     const e = normalizeEmail(email);
@@ -65,6 +102,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { error: authMessage("Signed in but session missing. Refresh the page.", "no_session") };
       }
     }
+    clearGuestMode();
     return { error: null };
   };
 
@@ -90,6 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     if (data.session) {
+      clearGuestMode();
       return { error: null };
     }
 
@@ -99,11 +138,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
 
     if (!signInError && signInData.session) {
+      clearGuestMode();
       return { error: null };
     }
 
     const { data: after } = await supabase.auth.getSession();
     if (after.session) {
+      clearGuestMode();
       return { error: null };
     }
 
@@ -115,11 +156,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signOut = async () => {
+    clearGuestMode();
     await supabase.auth.signOut();
   };
 
   return (
-    <AuthContext.Provider value={{ user, session, loading, signIn, signUp, signOut }}>
+    <AuthContext.Provider
+      value={{ user, session, loading, isGuest, enterAsGuest, signIn, signUp, signOut }}
+    >
       {children}
     </AuthContext.Provider>
   );

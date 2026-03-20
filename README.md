@@ -4,7 +4,9 @@ Vite + React + TypeScript tutor app with Supabase backend.
 
 ## Authentication (email / password)
 
-Sign-in uses [Supabase Auth](https://supabase.com/docs/guides/auth) (`signUp` / `signInWithPassword`). Configure your Supabase project:
+Sign-in uses [Supabase Auth](https://supabase.com/docs/guides/auth) (`signUp` / `signInWithPassword`). **Try as guest** on the login screen skips account creation and still runs the tutor (quiz, scan, chat); guest state is kept in `sessionStorage` until you leave or sign in.
+
+Configure your Supabase project:
 
 1. **Authentication → Providers** → **Email**: enable it. Turn **off** **“Confirm email”** / **“Confirm sign up”** (wording varies; you want sign-ups to get a session immediately). If it stays on, new users can look “created” but password sign-in fails until they confirm — delete test users under **Authentication → Users** after changing this. You can turn off **Google** if you no longer use it.
 2. **Authentication → URL configuration**: set **Site URL** to your production origin. For local dev, add `http://localhost:5173` (or your Vite port) under **Redirect URLs**.

@@ -26,7 +26,7 @@ const authSchema = z.object({
 type AuthFormValues = z.infer<typeof authSchema>;
 
 export default function LoginPage() {
-  const { signIn, signUp } = useAuth();
+  const { signIn, signUp, enterAsGuest } = useAuth();
   const [signInPending, setSignInPending] = useState(false);
   const [signUpPending, setSignUpPending] = useState(false);
 
@@ -99,7 +99,7 @@ export default function LoginPage() {
             </div>
             <h1 className="text-2xl font-bold text-foreground">Welcome</h1>
             <p className="text-muted-foreground text-sm">
-              Create an account or sign in to track your progress
+              Sign in to save progress, or try the tutor as a guest (no account).
             </p>
           </div>
 
@@ -181,6 +181,28 @@ export default function LoginPage() {
               </Form>
             </TabsContent>
           </Tabs>
+
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t border-border" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase tracking-wide">
+              <span className="bg-card px-2 text-muted-foreground">or</span>
+            </div>
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full h-11"
+            size="lg"
+            onClick={() => enterAsGuest()}
+          >
+            Try as guest
+          </Button>
+          <p className="text-center text-xs text-muted-foreground">
+            Guest mode uses this device only. Core quiz, scan, and chat still work.
+          </p>
         </CardContent>
       </Card>
     </div>
