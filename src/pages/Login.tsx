@@ -46,9 +46,25 @@ export default function LoginPage() {
     setSignInPending(false);
     if (result.error) {
       const code = result.error.code;
+      const msg = result.error.message.toLowerCase();
       if (code === "email_not_confirmed") {
         toast.error(
           "Confirm your email from the link Supabase sent, or turn OFF “Confirm email” in Supabase (Authentication → Providers → Email), remove this user under Users, and sign up again.",
+        );
+        return;
+      }
+      if (code === "signup_blocked") {
+        toast.error(result.error.message, { duration: 14_000 });
+        return;
+      }
+      if (
+        code === "invalid_credentials" ||
+        msg.includes("invalid login") ||
+        msg.includes("invalid email or password")
+      ) {
+        toast.error(
+          "Wrong email or password — or the account is waiting on email confirmation. In Supabase turn OFF “Confirm email”, delete this user under Authentication → Users, then sign up again.",
+          { duration: 12_000 },
         );
         return;
       }
@@ -62,10 +78,14 @@ export default function LoginPage() {
     const result = await signUp(values.email, values.password);
     setSignUpPending(false);
     if (result.error) {
-      toast.error(result.error.message);
+      if (result.error.code === "signup_blocked") {
+        toast.error(result.error.message, { duration: 14_000 });
+      } else {
+        toast.error(result.error.message);
+      }
       return;
     }
-    toast.success("Account created");
+    toast.success("You’re in");
   };
 
   return (
