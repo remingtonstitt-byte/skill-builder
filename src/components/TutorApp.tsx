@@ -589,11 +589,9 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
       const hint = hintFor(item, text);
       const skillName = skills().find(s => s.id === item.skillId)?.name || item.skillId;
 
-      // Give thoughtful guidance based on their input
-      let guidance = `💡 **Thinking about "${text}"…**\n\n`;
-      guidance += `This question is about **${skillName}**.\n\n`;
+      let guidance = `💡 **On what you wrote:** "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"\n\n`;
+      guidance += `Practice focus: **${skillName}** (hints never include the scored answer).\n\n`;
       guidance += `${hint}\n\n`;
-      if (item.rubric) guidance += `📝 **Key idea:** ${item.rubric}\n\n`;
       guidance += `Type **skip** for a new question, or keep discussing!`;
 
       addMsg("tutor", guidance, "hint");
@@ -756,6 +754,10 @@ function SessionView({ session, answer, setAnswer, onSubmit, onQuit, store, judg
   const item = session.currentItem!;
   const hasFeedback = session.feedback !== null;
   const [hint, setHint] = useState<string | null>(null);
+
+  useEffect(() => {
+    setHint(null);
+  }, [item.id]);
   const tierColors: Record<string, string> = {
     A: "bg-tier-a text-primary-foreground",
     B: "bg-tier-b text-primary-foreground",
