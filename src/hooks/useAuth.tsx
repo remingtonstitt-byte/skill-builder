@@ -2,9 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 import { supabase } from "@/integrations/supabase/client";
 import type { AuthError, User, Session } from "@supabase/supabase-js";
 
-export type AuthResult =
-  | { error: null; needsEmailConfirmation?: boolean }
-  | { error: AuthError; needsEmailConfirmation?: undefined };
+export type AuthResult = { error: null } | { error: AuthError };
 
 interface AuthContextType {
   user: User | null;
@@ -47,15 +45,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signUp = async (email: string, password: string): Promise<AuthResult> => {
-    const { data, error } = await supabase.auth.signUp({
+    const { error } = await supabase.auth.signUp({
       email,
       password,
       options: { emailRedirectTo: `${window.location.origin}/` },
     });
     if (error) return { error };
-
-    const needsEmailConfirmation = Boolean(data.user && !data.session);
-    return { error: null, needsEmailConfirmation };
+    return { error: null };
   };
 
   const signOut = async () => {

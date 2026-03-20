@@ -15,7 +15,6 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Brain } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -30,7 +29,6 @@ export default function LoginPage() {
   const { signIn, signUp } = useAuth();
   const [signInPending, setSignInPending] = useState(false);
   const [signUpPending, setSignUpPending] = useState(false);
-  const [confirmationMessage, setConfirmationMessage] = useState(false);
 
   const signInForm = useForm<AuthFormValues>({
     resolver: zodResolver(authSchema),
@@ -44,7 +42,6 @@ export default function LoginPage() {
 
   const onSignIn = async (values: AuthFormValues) => {
     setSignInPending(true);
-    setConfirmationMessage(false);
     const result = await signIn(values.email, values.password);
     setSignInPending(false);
     if (result.error) {
@@ -55,18 +52,10 @@ export default function LoginPage() {
 
   const onSignUp = async (values: AuthFormValues) => {
     setSignUpPending(true);
-    setConfirmationMessage(false);
     const result = await signUp(values.email, values.password);
     setSignUpPending(false);
     if (result.error) {
       toast.error(result.error.message);
-      return;
-    }
-    if (result.needsEmailConfirmation) {
-      setConfirmationMessage(true);
-      toast.message("Check your email", {
-        description: "We sent a confirmation link. Open it to finish signing up.",
-      });
       return;
     }
     toast.success("Account created");
@@ -86,15 +75,6 @@ export default function LoginPage() {
               Create an account or sign in to track your progress
             </p>
           </div>
-
-          {confirmationMessage && (
-            <Alert>
-              <AlertDescription>
-                Check your email for a confirmation link. After you confirm, sign in here with the
-                same password.
-              </AlertDescription>
-            </Alert>
-          )}
 
           <Tabs defaultValue="signin" className="w-full">
             <TabsList className="grid w-full grid-cols-2">
