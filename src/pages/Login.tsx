@@ -45,6 +45,13 @@ export default function LoginPage() {
     const result = await signIn(values.email, values.password);
     setSignInPending(false);
     if (result.error) {
+      const code = result.error.code;
+      if (code === "email_not_confirmed") {
+        toast.error(
+          "Confirm your email from the link Supabase sent, or turn OFF “Confirm email” in Supabase (Authentication → Providers → Email), remove this user under Users, and sign up again.",
+        );
+        return;
+      }
       toast.error(result.error.message);
       return;
     }
