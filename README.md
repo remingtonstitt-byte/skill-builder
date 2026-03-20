@@ -15,6 +15,12 @@ Environment variables (see `.env`):
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_PUBLISHABLE_KEY`
 
+### Deploying on Vercel
+
+1. Connect this GitHub repo to a Vercel project (import the repo, root directory `.`, framework **Vite**).
+2. **Environment variables** (Project → Settings → Environment Variables): add `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` for **Production** and **Preview**. Vite inlines these at **build** time — redeploy after adding or changing them.
+3. **Redeploy** the latest `main` commit. If the live site still shows “Sign in with Google”, the deployment is using an old build or a different repo/branch — fix the Git connection in Vercel, then redeploy.
+
 ## Scripts
 
 - `npm run dev` — start dev server  
