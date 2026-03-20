@@ -17,7 +17,73 @@ const STOP = new Set([
   "more", "most", "less", "least", "very", "just", "only", "also", "even", "so", "than", "too",
 ]);
 
-/** Strategy line for the active skill — never mentions the correct answer. */
+/** Prompt is about recall / geography / simple facts, not claim–evidence style drills. */
+function isFactualKnowledgeQuestion(promptL: string): boolean {
+  if (/\b(claim|evidence|assumption|assumptions|conclusion|infer|correlation|causation|counterexample|necessary|sufficient|premise|fallacy|label the|classify|which (label|option))\b/.test(promptL)) {
+    return false;
+  }
+  if (/\b(capital of|largest city (in|of)|currency (of|in)|population of|official language|national anthem|how many states in)\b/.test(promptL)) {
+    return true;
+  }
+  if (/\bwho (invented|discovered|wrote|painted|composed|founded)\b/.test(promptL)) {
+    return true;
+  }
+  if (/^what is the (capital|population|currency|formula|name|speed of|distance|value)\b/.test(promptL)) {
+    return true;
+  }
+  if (/\b(in what year was|what year did|when was \w+ (born|founded))\b/.test(promptL)) {
+    return true;
+  }
+  if (/^(what|who|where|when) is\b/.test(promptL) && promptL.length < 100) {
+    return true;
+  }
+  return false;
+}
+
+/** Hints for trivia / recall — never state the answer. */
+function factualKnowledgeHint(
+  item: Item,
+  promptL: string,
+  lastAnswer: string,
+  expected: string,
+): string {
+  const expectedNums = extractNumbers(expected).length ? extractNumbers(expected) : extractNumbers(item.prompt || "");
+  const userNums = extractNumbers(lastAnswer);
+
+  if (expectedNums.length && userNums.length) {
+    const target = expectedNums[0];
+    const userNum = userNums[0];
+    const diff = Math.abs(target - userNum);
+    const dir = userNum < target ? "higher" : "lower";
+    const rel = diff / Math.max(Math.abs(target), 1);
+    if (diff <= 2) return `Your number is **very close**—try nudging slightly **${dir}**.`;
+    if (diff <= 15 || rel < 0.08) return `You're in a plausible range—adjust a bit **${dir}** and double-check **units** (years, %, etc.).`;
+    if (rel < 0.35) return `The **scale** might be off—re-read which quantity is asked for, then try **${dir}**.`;
+    return `Re-read which **exact number** the question wants; your answer may be the wrong **magnitude**.`;
+  }
+  if (expectedNums.length && lastAnswer && !userNums.length) {
+    return `This expects a **number**—give one clear value with the right **units**.`;
+  }
+
+  if (/\bcapital of\b/.test(promptL)) {
+    return "A **capital** is the city where the country’s **main government** is usually based. Answer with a **city name** (proper noun), not the country itself.";
+  }
+  if (/\b(where|which country|which continent|which state)\b/.test(promptL) && /\b(is|are|located|situated)\b/.test(promptL)) {
+    return "Pin down the **kind of place** asked for (country, city, region)—then the **specific name** at that level.";
+  }
+  if (/\bwho (is|was|are|were)\b/.test(promptL) || /^who\b/.test(promptL)) {
+    return "Give the **person (or role)** the question names—not a paragraph of context.";
+  }
+  if (/\bwhen\b/.test(promptL) || /\bwhat year\b/.test(promptL)) {
+    return "Narrow to a **date, year, or era** the wording points to—check whether it wants **order** or a **single** time.";
+  }
+  if (/^what (is|are)\b/.test(promptL)) {
+    return "Give a **short factual answer**: name, number, or phrase—**only** what was asked, not extra explanation.";
+  }
+  return "Read the question literally: it wants a **specific fact**—answer in the **shortest form** that fits.";
+}
+
+/** Strategy line for critical-thinking skill items — never mentions the correct answer. */
 function skillStrategy(skillId: string): string {
   const map: Record<string, string> = {
     claim_evidence:
@@ -36,7 +102,6 @@ function skillStrategy(skillId: string): string {
   return map[skillId] || "Break the prompt into smaller claims and test each one against the wording.";
 }
 
-/** Pull a few content words from the question for a tailored nudge (never from the stored answer). */
 function keyTermsFromPrompt(prompt: string, banLower: Set<string>, max = 4): string[] {
   const words = prompt
     .toLowerCase()
@@ -69,15 +134,20 @@ function questionShapeHint(promptL: string, skillLine: string): string | null {
 }
 
 /**
- * Hints grounded in the **question** and **skill**, nudging without revealing the stored answer.
+ * Hints grounded in the **question** (and skill only for thinking drills).
  * Never prints `item.answer` or target numbers/decades.
  */
 export function hintFor(item: Item, lastUserAnswer?: string): string {
   const prompt = item.prompt || "";
   const expected = item.answer || "";
   const lastAnswer = (lastUserAnswer || "").trim();
-  const skillLine = skillStrategy(item.skillId);
   const promptL = prompt.toLowerCase();
+
+  if (isFactualKnowledgeQuestion(promptL)) {
+    return factualKnowledgeHint(item, promptL, lastAnswer, expected);
+  }
+
+  const skillLine = skillStrategy(item.skillId);
 
   const banFromAnswer = new Set<string>();
   const ansLower = expected.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2);
@@ -86,7 +156,6 @@ export function hintFor(item: Item, lastUserAnswer?: string): string {
   const expectedNums = extractNumbers(expected).length ? extractNumbers(expected) : extractNumbers(prompt);
   const userNums = extractNumbers(lastAnswer);
 
-  // Numeric: only directional nudge vs user's guess — never name the correct value or decade
   if (expectedNums.length && userNums.length) {
     const target = expectedNums[0];
     const userNum = userNums[0];
@@ -116,10 +185,10 @@ export function hintFor(item: Item, lastUserAnswer?: string): string {
 
   const terms = keyTermsFromPrompt(prompt, banFromAnswer, 4);
   if (terms.length >= 2) {
-    return `${skillLine} Trace how **${terms.slice(0, 3).join("**, **")}** show up in the question—what is the prompt *actually* asking you to judge?`;
+    return `${skillLine} Notice **${terms[0]}** and **${terms[1]}** in the setup—which part is offered as support, and which part is the conclusion?`;
   }
   if (terms.length === 1) {
-    return `${skillLine} Focus on how **${terms[0]}** is used in the question and what claim depends on it.`;
+    return `${skillLine} Focus on what **${terms[0]}** is doing in the argument—not the wording around it only.`;
   }
 
   const skillName = skills().find(s => s.id === item.skillId)?.name;
