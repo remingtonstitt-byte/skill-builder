@@ -536,6 +536,12 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
         </Button>
       </div>
 
+      <p className="text-center text-[10px] text-muted-foreground/90 max-w-md px-4 tabular-nums leading-relaxed">
+        {`App v${__APP_VERSION__} · build ${__BUILD_SHA__} · Claude chat → `}
+        <span className="font-mono">judge-answer</span>
+        {` (redeploy that function after updates)`}
+      </p>
+
       {(user || isGuest) && (
         <div className="mt-8 flex flex-col items-center gap-2 sm:flex-row sm:gap-3">
           <div className="text-center sm:text-left">
