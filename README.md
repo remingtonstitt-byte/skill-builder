@@ -37,6 +37,16 @@ If unset, the app uses defaults in [`src/integrations/supabase/public-client-con
 2. **Environment variables** are optional because of the embedded public client defaults; add `VITE_SUPABASE_*` in Vercel if you want to override without changing code. Redeploy after changing them.
 3. **Redeploy** the latest `main` commit if the live site looks stale.
 
+### Claude chat + quiz AI (one Edge Function)
+
+Home-screen chat and **Chat Mode** call the **`judge-answer`** Edge Function with `mode: "tutor-chat"` (quiz grading uses the same function without that field). You only need **one** deploy and the **`claude`** secret.
+
+1. Supabase CLI (from repo root):  
+   `supabase functions deploy judge-answer`
+2. **Project Settings → Edge Functions** (or CLI): set secret **`claude`** to your Anthropic API key (same as you use if quiz AI grading already works).
+
+After changing `supabase/functions/judge-answer/index.ts`, **redeploy** `judge-answer` or chat will show “Could not reach the tutor.”
+
 ## Scripts
 
 - `npm run dev` — start dev server  

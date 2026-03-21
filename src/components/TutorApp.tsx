@@ -88,7 +88,7 @@ const CHAT_MODE_INTRO =
   "💬 **Chat Mode** — real back-and-forth with the AI tutor (not graded).\n\nAsk anything in your own words — typed or via the **mic** (your speech is turned into **text** on your device; only that text is sent).\n\nType **quiz** for a practice question. Use **Home → Start Quiz** for graded practice.\n\n📎 Upload an image or type **context: your text** to ground the chat.";
 
 const HOME_CLAUDE_INTRO =
-  "**Claude tutor** — ask anything below. Replies come from your Supabase Edge Function `tutor-chat` (plain text only; no audio sent to the server).\n\nThis is the **same conversation** as **Chat Mode**. Scanning an image on Home adds context for both quiz and chat.";
+  "**Claude tutor** — ask anything below. Replies use the same Edge Function as quiz grading (`judge-answer` with chat mode; plain text only, no audio to the server).\n\nThis is the **same conversation** as **Chat Mode**. Scanning an image on Home adds context for both quiz and chat.";
 
 export default function TutorApp() {
   const [view, setView] = useState<View>("home");
@@ -344,7 +344,7 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
         claudeTurnsRef.current = claudeTurnsRef.current.slice(0, -1);
         pushHomeLine(
           "tutor",
-          `⚠️ ${result.error} If this persists, deploy the Edge Function: \`supabase functions deploy tutor-chat\` and set the \`claude\` secret in Supabase.`
+          `⚠️ ${result.error} Redeploy: \`supabase functions deploy judge-answer\` and set the \`claude\` secret (Dashboard → Edge Functions → Secrets).`
         );
         return;
       }
@@ -393,8 +393,8 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
             Claude on this page
           </CardTitle>
           <p className="text-xs text-muted-foreground font-normal leading-relaxed">
-            Type below and press send — your message goes to the <span className="font-mono text-[10px]">tutor-chat</span> Edge
-            Function as plain text (no audio upload). This is the <strong>same conversation</strong> as Chat Mode.
+            Type below and press send — your message goes to the <span className="font-mono text-[10px]">judge-answer</span> Edge
+            Function (chat mode) as plain text (no audio upload). This is the <strong>same conversation</strong> as Chat Mode.
             {contextText ? " Scanned text is included as context." : ""}
           </p>
         </CardHeader>
