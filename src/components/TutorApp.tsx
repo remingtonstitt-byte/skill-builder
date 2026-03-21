@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type MutableRefObject } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,7 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   CheckCircle, XCircle, Brain, ArrowRight, RotateCcw, BarChart3,
   ImageIcon, X, MessageCircle, Lightbulb, HelpCircle, SkipForward, Send, Volume2, VolumeX,
-  Home, LogOut, ScanLine, Upload,
+  Home, LogOut, ScanLine, Upload, Mic,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { type Item, type SkillState, mastery, skills } from "@/lib/tutor/domain";
@@ -18,6 +18,8 @@ import { type ImageScanResult, scanImage } from "@/lib/tutor/image-scan";
 import { hintFor, rewriteItemPrompt } from "@/lib/tutor/chat-helpers";
 import { generateContextItem } from "@/lib/tutor/context-items";
 import { speak, stopSpeaking, detectTTS } from "@/lib/tutor/tts";
+import { detectSTT, startListening } from "@/lib/tutor/stt";
+import { tutorChat, type TutorChatTurn } from "@/lib/tutor/tutor-chat";
 import { aiJudge, needsAIJudge } from "@/lib/tutor/ai-judge";
 
 type View = "home" | "session" | "chat" | "report" | "scan";
@@ -78,7 +80,15 @@ interface ChatMessage {
   role: "tutor" | "user";
   text: string;
   type?: "info" | "correct" | "incorrect" | "hint" | "report" | "mastery";
+  /** Set when the user spoke via mic — STT text is what was sent (not audio). */
+  viaVoice?: boolean;
 }
+
+const CHAT_MODE_INTRO =
+  "💬 **Chat Mode** — real back-and-forth with the AI tutor (not graded).\n\nAsk anything in your own words — typed or via the **mic** (your speech is turned into **text** on your device; only that text is sent).\n\nType **quiz** for a practice question. Use **Home → Start Quiz** for graded practice.\n\n📎 Upload an image or type **context: your text** to ground the chat.";
+
+const HOME_CLAUDE_INTRO =
+  "**Claude tutor** — ask anything below. Replies come from your Supabase Edge Function `tutor-chat` (plain text only; no audio sent to the server).\n\nThis is the **same conversation** as **Chat Mode**. Scanning an image on Home adds context for both quiz and chat.";
 
 export default function TutorApp() {
   const [view, setView] = useState<View>("home");
@@ -88,6 +98,9 @@ export default function TutorApp() {
   const [seedCounter, setSeedCounter] = useState(1);
   const [contextText, setContextText] = useState<string | null>(null);
   const [rewriteInstruction, setRewriteInstruction] = useState("");
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  /** Shared Claude API thread (home + chat mode). */
+  const claudeTurnsRef = useRef<TutorChatTurn[]>([]);
 
   const persist = useCallback((s: TutorStore) => {
     setStore(s);
@@ -209,6 +222,9 @@ export default function TutorApp() {
         contextText={contextText}
         rewriteInstruction={rewriteInstruction}
         onRewriteChange={setRewriteInstruction}
+        ttsEnabled={ttsEnabled}
+        onTtsEnabledChange={setTtsEnabled}
+        claudeTurnsRef={claudeTurnsRef}
       />
     );
   }
@@ -244,6 +260,11 @@ export default function TutorApp() {
         onReport={() => setView("report")}
         rewriteInstruction={rewriteInstruction}
         onRewriteChange={setRewriteInstruction}
+        ttsEnabled={ttsEnabled}
+        onTtsEnabledChange={setTtsEnabled}
+        appContextText={contextText}
+        setAppContextText={setContextText}
+        claudeTurnsRef={claudeTurnsRef}
       />
     );
   }
@@ -252,7 +273,7 @@ export default function TutorApp() {
 }
 
 // ── Home ──
-function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, contextText, rewriteInstruction, onRewriteChange }: {
+function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, contextText, rewriteInstruction, onRewriteChange, ttsEnabled, onTtsEnabledChange, claudeTurnsRef }: {
   onStart: (n?: number) => void;
   onChat: () => void;
   onReport: () => void;
@@ -262,16 +283,207 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
   contextText: string | null;
   rewriteInstruction: string;
   onRewriteChange: (v: string) => void;
+  ttsEnabled: boolean;
+  onTtsEnabledChange: (enabled: boolean) => void;
+  claudeTurnsRef: MutableRefObject<TutorChatTurn[]>;
 }) {
   const { user, isGuest, signOut } = useAuth();
   const [showOcr, setShowOcr] = useState(false);
+  const ttsAvailable = detectTTS().backend !== null;
+  const sttHome = detectSTT().supported;
+
+  const homeBootstrap = (() => {
+    const turns = claudeTurnsRef.current;
+    if (turns.length === 0) {
+      return {
+        lines: [{ id: 1, role: "tutor" as const, text: HOME_CLAUDE_INTRO }],
+        nextId: 1,
+      };
+    }
+    let id = 0;
+    const lines = turns.map(t => ({
+      id: ++id,
+      role: t.role === "user" ? ("user" as const) : ("tutor" as const),
+      text: t.content,
+    }));
+    return { lines, nextId: id };
+  })();
+  const [homeAiLines, setHomeAiLines] = useState(homeBootstrap.lines);
+  const [homeAiInput, setHomeAiInput] = useState("");
+  const [homeAiBusy, setHomeAiBusy] = useState(false);
+  const [homeListening, setHomeListening] = useState(false);
+  const homeLineIdRef = useRef(homeBootstrap.nextId);
+  const homeListenStopRef = useRef<(() => void) | null>(null);
+  const homeScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    homeScrollRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [homeAiLines]);
+
+  const homeSessionContext = useCallback(() => {
+    if (!contextText?.trim()) return "";
+    return `[Material from your scan or paste — plain text, not audio]\n${contextText.trim().slice(0, 12000)}`;
+  }, [contextText]);
+
+  const pushHomeLine = useCallback((role: "user" | "tutor", text: string) => {
+    const id = ++homeLineIdRef.current;
+    setHomeAiLines(prev => [...prev, { id, role, text }]);
+  }, []);
+
+  const sendHomeClaude = useCallback(
+    async (raw: string) => {
+      const t = raw.trim();
+      if (!t || homeAiBusy) return;
+      setHomeAiInput("");
+      pushHomeLine("user", t);
+      claudeTurnsRef.current = [...claudeTurnsRef.current, { role: "user", content: t }];
+      setHomeAiBusy(true);
+      const result = await tutorChat(claudeTurnsRef.current.slice(-24), homeSessionContext());
+      setHomeAiBusy(false);
+      if (result.error) {
+        claudeTurnsRef.current = claudeTurnsRef.current.slice(0, -1);
+        pushHomeLine(
+          "tutor",
+          `⚠️ ${result.error} If this persists, deploy the Edge Function: \`supabase functions deploy tutor-chat\` and set the \`claude\` secret in Supabase.`
+        );
+        return;
+      }
+      claudeTurnsRef.current = [...claudeTurnsRef.current, { role: "assistant", content: result.text }];
+      pushHomeLine("tutor", result.text);
+      if (ttsEnabled && detectTTS().backend) speak(result.text);
+    },
+    [homeAiBusy, homeSessionContext, pushHomeLine, claudeTurnsRef, ttsEnabled]
+  );
+
+  const toggleHomeMic = useCallback(() => {
+    if (homeAiBusy) return;
+    if (homeListening) {
+      homeListenStopRef.current?.();
+      homeListenStopRef.current = null;
+      setHomeListening(false);
+      return;
+    }
+    setHomeListening(true);
+    const { stop } = startListening({
+      onFinal: (spoken) => {
+        homeListenStopRef.current = null;
+        setHomeListening(false);
+        if (spoken.trim()) void sendHomeClaude(spoken.trim());
+      },
+      onError: () => {
+        homeListenStopRef.current = null;
+        setHomeListening(false);
+      },
+      onEnd: () => {
+        homeListenStopRef.current = null;
+        setHomeListening(false);
+      },
+    });
+    homeListenStopRef.current = stop;
+  }, [homeAiBusy, homeListening, sendHomeClaude]);
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-6">
-      <h1 className="text-3xl font-bold text-foreground mb-8">Adaptive Stress Tutor</h1>
+    <div className="min-h-screen flex flex-col items-center justify-center p-6 gap-6">
+      <h1 className="text-3xl font-bold text-foreground text-center">Adaptive Stress Tutor</h1>
+
+      <Card className="w-full max-w-md border-primary/25 shadow-sm">
+        <CardHeader className="pb-2 pt-4 px-4">
+          <CardTitle className="flex items-center gap-2 text-lg font-semibold">
+            <Brain className="w-5 h-5 text-primary shrink-0" />
+            Claude on this page
+          </CardTitle>
+          <p className="text-xs text-muted-foreground font-normal leading-relaxed">
+            Type below and press send — your message goes to the <span className="font-mono text-[10px]">tutor-chat</span> Edge
+            Function as plain text (no audio upload). This is the <strong>same conversation</strong> as Chat Mode.
+            {contextText ? " Scanned text is included as context." : ""}
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3 px-4 pb-4">
+          <ScrollArea className="h-52 rounded-md border border-border bg-muted/30 p-3">
+            <div className="space-y-2 text-sm pr-2">
+              {homeAiLines.map(line => (
+                <div
+                  key={line.id}
+                  className={
+                    line.role === "user"
+                      ? "rounded-lg bg-primary/15 px-3 py-2 text-foreground"
+                      : "rounded-lg border border-border/80 bg-card px-3 py-2 text-foreground"
+                  }
+                >
+                  {line.role === "user" ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">You</span>
+                  ) : (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Claude</span>
+                  )}
+                  <div className={line.role === "user" ? "mt-1 whitespace-pre-wrap" : "mt-1 whitespace-pre-wrap"}>
+                    {line.role === "tutor" ? <SimpleMarkdown text={line.text} /> : line.text}
+                  </div>
+                </div>
+              ))}
+              <div ref={homeScrollRef} />
+            </div>
+          </ScrollArea>
+          <div className="flex gap-2">
+            <Input
+              placeholder={contextText ? "Ask about your material…" : "Ask the tutor anything…"}
+              value={homeAiInput}
+              onChange={e => setHomeAiInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !e.shiftKey && void sendHomeClaude(homeAiInput)}
+              disabled={homeAiBusy}
+              className="h-10 flex-1"
+            />
+            {sttHome && (
+              <Button
+                type="button"
+                variant={homeListening ? "default" : "outline"}
+                size="icon"
+                className="h-10 w-10 shrink-0"
+                disabled={homeAiBusy}
+                onClick={toggleHomeMic}
+                title={homeListening ? "Stop" : "Speak"}
+              >
+                <Mic className="w-4 h-4" />
+              </Button>
+            )}
+            <Button
+              type="button"
+              className="h-10 px-4 shrink-0"
+              disabled={!homeAiInput.trim() || homeAiBusy}
+              onClick={() => void sendHomeClaude(homeAiInput)}
+            >
+              {homeAiBusy ? <span className="text-xs">…</span> : <Send className="w-4 h-4" />}
+            </Button>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Button type="button" variant="ghost" size="sm" className="h-8 text-xs" onClick={onChat}>
+              Open full Chat Mode
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={`h-8 gap-1.5 text-xs ${ttsEnabled && ttsAvailable ? "border-primary/50 text-primary" : ""}`}
+              disabled={!ttsAvailable}
+              title={
+                ttsAvailable
+                  ? "Read tutor replies aloud in the browser"
+                  : "Read-aloud needs speech synthesis (try Chrome or Edge on desktop)."
+              }
+              onClick={() => {
+                if (!ttsAvailable) return;
+                if (ttsEnabled) stopSpeaking();
+                onTtsEnabledChange(!ttsEnabled);
+              }}
+            >
+              {ttsEnabled && ttsAvailable ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+              Tutor voice
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {hasContext && (
-        <div className="w-full max-w-xs mb-4 space-y-2">
+        <div className="w-full max-w-md space-y-2">
           <p className="text-sm text-primary">📎 Quiz is based on your scanned upload.</p>
           <button
             onClick={() => setShowOcr(!showOcr)}
@@ -287,7 +499,7 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
         </div>
       )}
 
-      <div className="flex flex-col gap-3 w-full max-w-xs">
+      <div className="flex flex-col gap-3 w-full max-w-md">
         <Button onClick={onScan} variant="outline" className="h-12 text-lg" size="lg">
           <ImageIcon className="w-5 h-5 mr-2" /> Scan Image
         </Button>
@@ -297,7 +509,24 @@ function HomeView({ onStart, onChat, onReport, onReset, onScan, hasContext, cont
         <Button onClick={onChat} variant="outline" className="h-12 text-lg" size="lg">
           Chat Mode
         </Button>
-
+        <Button
+          variant="outline"
+          className={`h-12 text-lg gap-2 ${ttsEnabled && ttsAvailable ? "border-primary/50 text-primary" : ""}`}
+          disabled={!ttsAvailable}
+          title={
+            ttsAvailable
+              ? "Read tutor replies aloud in the browser"
+              : "Read-aloud needs speech synthesis (try Chrome or Edge on desktop)."
+          }
+          onClick={() => {
+            if (!ttsAvailable) return;
+            if (ttsEnabled) stopSpeaking();
+            onTtsEnabledChange(!ttsEnabled);
+          }}
+        >
+          {ttsEnabled && ttsAvailable ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
+          {ttsEnabled && ttsAvailable ? "Tutor Voice On" : "Tutor Voice Off"}
+        </Button>
 
         <Button onClick={onReport} variant="outline" className="h-10">
           Report
@@ -408,13 +637,18 @@ function ScanView({ onBack, onScanned, contextText, onClearContext }: {
 }
 
 // ── Chat View ──
-function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewriteChange }: {
+function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewriteChange, ttsEnabled, onTtsEnabledChange, appContextText, setAppContextText, claudeTurnsRef }: {
   store: TutorStore;
   persist: (s: TutorStore) => void;
   onBack: () => void;
   onReport: () => void;
   rewriteInstruction: string;
   onRewriteChange: (v: string) => void;
+  ttsEnabled: boolean;
+  onTtsEnabledChange: (enabled: boolean) => void;
+  appContextText: string | null;
+  setAppContextText: (v: string | null) => void;
+  claudeTurnsRef: MutableRefObject<TutorChatTurn[]>;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -426,18 +660,62 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
   const scrollRef = useRef<HTMLDivElement>(null);
   const msgId = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [contextText, setContextText] = useState<string | null>(null);
-  const [ttsEnabled, setTtsEnabled] = useState(false);
   const ttsAvailable = detectTTS().backend !== null;
+  const sttAvailable = detectSTT().supported;
+  const ttsEnabledRef = useRef(ttsEnabled);
+  useEffect(() => {
+    ttsEnabledRef.current = ttsEnabled;
+  }, [ttsEnabled]);
+  const [chatting, setChatting] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const listenStopRef = useRef<(() => void) | null>(null);
 
-  const addMsg = useCallback((role: "tutor" | "user", text: string, type?: ChatMessage["type"]) => {
-    const id = ++msgId.current;
-    setMessages(prev => [...prev, { id, role, text, type }]);
-    // Speak tutor messages if TTS is on
-    if (role === "tutor" && ttsEnabled) {
-      speak(text);
+  const addMsg = useCallback(
+    (role: "tutor" | "user", text: string, type?: ChatMessage["type"], opts?: { viaVoice?: boolean }) => {
+      const id = ++msgId.current;
+      setMessages(prev => [...prev, { id, role, text, type, viaVoice: opts?.viaVoice }]);
+      if (role === "tutor" && ttsEnabledRef.current) {
+        speak(text);
+      }
+    },
+    []
+  );
+
+  const buildSessionContext = useCallback(() => {
+    const parts: string[] = [];
+    if (appContextText?.trim()) {
+      parts.push(
+        `[Material the student is working from — plain text from scan or paste, not an audio file]\n${appContextText.trim().slice(0, 12000)}`
+      );
     }
-  }, []);
+    if (pendingItem) {
+      const skillName = skills().find(s => s.id === pendingItem.skillId)?.name || pendingItem.skillId;
+      parts.push(
+        `[Ungraded practice question — skill: ${skillName}, tier ${pendingItem.tier}]\n${pendingItem.prompt}`
+      );
+    }
+    return parts.join("\n\n");
+  }, [appContextText, pendingItem]);
+
+  const sendToClaude = useCallback(
+    async (userText: string, voiceOpts?: { viaVoice?: boolean }) => {
+      addMsg("user", userText, undefined, { viaVoice: voiceOpts?.viaVoice });
+      setChatting(true);
+      claudeTurnsRef.current = [...claudeTurnsRef.current, { role: "user", content: userText }];
+      const payload = claudeTurnsRef.current.slice(-24);
+      const result = await tutorChat(payload, buildSessionContext());
+      setChatting(false);
+      if (result.error) {
+        addMsg("tutor", `⚠️ ${result.error}`, "hint");
+        claudeTurnsRef.current = claudeTurnsRef.current.slice(0, -1);
+        return;
+      }
+      claudeTurnsRef.current = [...claudeTurnsRef.current, { role: "assistant", content: result.text }];
+      addMsg("tutor", result.text, "info");
+    },
+    [addMsg, buildSessionContext]
+  );
 
   const askNext = useCallback((ctxOverride?: string | null) => {
     const currentStore = loadStore();
@@ -446,7 +724,7 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
     const rng = createRNG(seed);
     const { skillId, tier, reason } = selectNext(seed, currentStore.states);
 
-    const ctx = ctxOverride !== undefined ? ctxOverride : contextText;
+    const ctx = ctxOverride !== undefined ? ctxOverride : appContextText;
     let item: Item;
     if (ctx) {
       item = generateContextItem(() => rng.random(), skillId, tier, ctx);
@@ -460,7 +738,7 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
     const skillName = skills().find(s => s.id === skillId)?.name || skillId;
     const ctxBadge = ctx ? " 📎" : "";
     addMsg("tutor", `**${skillName}** · Tier ${tier}${ctxBadge}\n\n${item.prompt}`, "info");
-  }, [seedRef, addMsg, contextText]);
+  }, [seedRef, addMsg, appContextText]);
 
   const handleImageUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -468,7 +746,8 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
     addMsg("tutor", `📷 Scanning **${file.name}**…`, "info");
     const result = await scanImage(file);
     if (result.ocrText) {
-      setContextText(result.ocrText);
+      claudeTurnsRef.current = [];
+      setAppContextText(result.ocrText);
       addMsg("tutor", `✅ OCR extracted text. Future questions will use your upload as context.\n\n> "${result.ocrText.slice(0, 200)}${result.ocrText.length > 200 ? "…" : ""}"`, "info");
       addMsg("tutor", "Generating a context-based question now! 👇", "info");
       setTimeout(() => askNext(result.ocrText), 200);
@@ -479,127 +758,191 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
       }
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
-  }, [addMsg, askNext]);
+  }, [addMsg, askNext, setAppContextText, claudeTurnsRef]);
 
-  // Start with intro — no question, just guidance
+  const chatHydratedRef = useRef(false);
   useEffect(() => {
-    if (messages.length === 0) {
-      addMsg("tutor", "💬 **Chat Mode** — I'm here to help, not grade!\n\nAsk me anything about the material. I can give **hints**, **explain concepts**, or **rephrase questions**.\n\nType **quiz** to see a practice question (ungraded). Use the Quiz from the home screen for graded practice.\n\n📎 Upload an image or type **context: your text** to discuss specific material.", "info");
+    if (chatHydratedRef.current) return;
+    chatHydratedRef.current = true;
+    const turns = claudeTurnsRef.current;
+    let nid = 0;
+    if (turns.length === 0) {
+      msgId.current = 1;
+      setMessages([{ id: 1, role: "tutor", text: CHAT_MODE_INTRO, type: "info" }]);
+      return;
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    const rebuilt: ChatMessage[] = turns.map(t => ({
+      id: ++nid,
+      role: t.role === "user" ? "user" : "tutor",
+      text: t.content,
+    }));
+    msgId.current = nid;
+    setMessages(rebuilt);
+  }, [claudeTurnsRef]);
 
   // Auto-scroll
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if (!text) return;
-    setInput("");
+  const processUserMessage = useCallback(
+    async (text: string, opts?: { fromVoice?: boolean }) => {
+      const trimmed = text.trim();
+      if (!trimmed || chatting) return;
 
-    const cmd = text.toLowerCase();
-    addMsg("user", text);
+      const voice = { viaVoice: !!opts?.fromVoice };
+      const cmd = trimmed.toLowerCase();
 
-    if (cmd === "quit" || cmd === "exit" || cmd === "q") {
-      addMsg("tutor", "Bye! 👋", "info");
-      setTimeout(onBack, 800);
-      return;
-    }
-    if (cmd === "help" || cmd === "?") {
-      addMsg("tutor", "**Commands:** hint · why · skip · quiz · report · rephrase · quit\n\nThis is **help mode** — no grading! I'll explain, hint, and guide.\n\n**Rephrase quiz questions:**\n- `rephrase: short` — shorter questions\n- `rephrase: step by step` — step-by-step format\n- `clear rephrase` — reset to default\n\nUse the Quiz from home for graded practice.", "info");
-      return;
-    }
-    if (cmd === "report") {
-      const currentStore = loadStore();
-      const lines = skills().map(s => {
-        const st = currentStore.states[s.id];
-        if (!st) return `- ${s.name}: no data`;
-        const proved = masteryProof(st) ? " ✅ MASTERED" : "";
-        return `- **${s.name}**: ${summarizeState(st)}${proved}`;
-      });
-      addMsg("tutor", "📊 **Your mastery:**\n\n" + lines.join("\n"), "report");
-      return;
-    }
-    if (cmd === "why") {
-      if (lastSkill) {
-        addMsg("tutor", `I picked **${lastSkill}** because: ${lastReason}`, "info");
-      } else {
-        addMsg("tutor", "No selection info yet.", "info");
-      }
-      return;
-    }
-    if (cmd === "hint") {
-      if (!pendingItem) {
-        addMsg("tutor", "No current question. I'll ask one now!", "info");
-        askNext();
-      } else {
-        addMsg("tutor", hintFor(pendingItem), "hint");
-      }
-      return;
-    }
-    if (cmd === "skip") {
-      addMsg("tutor", "Skipped. Here's another one! ⏭️", "info");
-      askNext();
-      return;
-    }
-    if (cmd.startsWith("rephrase")) {
-      let instr = "";
-      if (text.includes(":")) {
-        instr = text.split(":", 2)[1].trim();
-      } else {
-        const parts = text.split(" ", 2);
-        instr = parts[1]?.trim() || "";
-      }
-      if (!instr) instr = "short and simple";
-      onRewriteChange(instr);
-      addMsg("tutor", `✏️ Quiz questions will now be rephrased as: **"${instr}"**\n\nThis applies when you start a Quiz from the home screen.`, "info");
-      return;
-    }
-    if (cmd === "clear rephrase" || cmd === "clear rewrite" || cmd === "reset style") {
-      onRewriteChange("");
-      addMsg("tutor", "✏️ Rephrase cleared. Quiz questions will use the default format.", "info");
-      return;
-    }
-    if (cmd === "quiz") {
-      askNext();
-      return;
-    }
-    if (cmd === "clear context") {
-      setContextText(null);
-      addMsg("tutor", "Context cleared. Questions will use built-in items again.", "info");
-      return;
-    }
-    if (text.toLowerCase().startsWith("context:")) {
-      const ctx = text.slice(8).trim();
-      if (ctx.length < 10) {
-        addMsg("tutor", "Context too short. Provide at least a sentence.", "info");
+      if (cmd === "quit" || cmd === "exit" || cmd === "q") {
+        addMsg("user", trimmed, undefined, voice);
+        addMsg("tutor", "Bye! 👋", "info");
+        setTimeout(onBack, 800);
         return;
       }
-      setContextText(ctx);
-      addMsg("tutor", `📎 Context set! I can discuss this material with you.\n\n> "${ctx.slice(0, 200)}${ctx.length > 200 ? "…" : ""}"`, "info");
-      addMsg("tutor", "Type **quiz** to see a practice question, or just ask me anything about it!", "info");
+      if (cmd === "help" || cmd === "?") {
+        addMsg("user", trimmed, undefined, voice);
+        addMsg(
+          "tutor",
+          "**Commands:** hint · why · skip · quiz · report · rephrase · quit\n\n**Voice:** use the mic — your words are **transcribed to text** and sent to the tutor (no audio upload).\n\n**Rephrase quiz questions:**\n- `rephrase: short` — shorter questions\n- `rephrase: step by step` — step-by-step format\n- `clear rephrase` — reset to default\n\nUse the Quiz from home for graded practice.",
+          "info"
+        );
+        return;
+      }
+      if (cmd === "report") {
+        addMsg("user", trimmed, undefined, voice);
+        const currentStore = loadStore();
+        const lines = skills().map(s => {
+          const st = currentStore.states[s.id];
+          if (!st) return `- ${s.name}: no data`;
+          const proved = masteryProof(st) ? " ✅ MASTERED" : "";
+          return `- **${s.name}**: ${summarizeState(st)}${proved}`;
+        });
+        addMsg("tutor", "📊 **Your mastery:**\n\n" + lines.join("\n"), "report");
+        return;
+      }
+      if (cmd === "why") {
+        addMsg("user", trimmed, undefined, voice);
+        if (lastSkill) {
+          addMsg("tutor", `I picked **${lastSkill}** because: ${lastReason}`, "info");
+        } else {
+          addMsg("tutor", "No selection info yet.", "info");
+        }
+        return;
+      }
+      if (cmd === "hint") {
+        addMsg("user", trimmed, undefined, voice);
+        if (!pendingItem) {
+          addMsg("tutor", "No current question. I'll ask one now!", "info");
+          askNext();
+        } else {
+          addMsg("tutor", hintFor(pendingItem), "hint");
+        }
+        return;
+      }
+      if (cmd === "skip") {
+        addMsg("user", trimmed, undefined, voice);
+        addMsg("tutor", "Skipped. Here's another one! ⏭️", "info");
+        askNext();
+        return;
+      }
+      if (cmd.startsWith("rephrase")) {
+        addMsg("user", trimmed, undefined, voice);
+        let instr = "";
+        if (trimmed.includes(":")) {
+          instr = trimmed.split(":", 2)[1].trim();
+        } else {
+          const parts = trimmed.split(" ", 2);
+          instr = parts[1]?.trim() || "";
+        }
+        if (!instr) instr = "short and simple";
+        onRewriteChange(instr);
+        addMsg(
+          "tutor",
+          `✏️ Quiz questions will now be rephrased as: **"${instr}"**\n\nThis applies when you start a Quiz from the home screen.`,
+          "info"
+        );
+        return;
+      }
+      if (cmd === "clear rephrase" || cmd === "clear rewrite" || cmd === "reset style") {
+        addMsg("user", trimmed, undefined, voice);
+        onRewriteChange("");
+        addMsg("tutor", "✏️ Rephrase cleared. Quiz questions will use the default format.", "info");
+        return;
+      }
+      if (cmd === "quiz") {
+        addMsg("user", trimmed, undefined, voice);
+        askNext();
+        return;
+      }
+      if (cmd === "clear context") {
+        addMsg("user", trimmed, undefined, voice);
+        setAppContextText(null);
+        claudeTurnsRef.current = [];
+        addMsg("tutor", "Context cleared. Questions will use built-in items again.", "info");
+        return;
+      }
+      if (trimmed.toLowerCase().startsWith("context:")) {
+        addMsg("user", trimmed, undefined, voice);
+        const ctx = trimmed.slice(8).trim();
+        if (ctx.length < 10) {
+          addMsg("tutor", "Context too short. Provide at least a sentence.", "info");
+          return;
+        }
+        claudeTurnsRef.current = [];
+        setAppContextText(ctx);
+        addMsg(
+          "tutor",
+          `📎 Context set! I can discuss this material with you.\n\n> "${ctx.slice(0, 200)}${ctx.length > 200 ? "…" : ""}"`,
+          "info"
+        );
+        addMsg("tutor", "Type **quiz** to see a practice question, or ask me anything — typed or by voice.", "info");
+        return;
+      }
+
+      await sendToClaude(trimmed, voice);
+    },
+    [chatting, pendingItem, lastSkill, lastReason, addMsg, askNext, onBack, onRewriteChange, sendToClaude, setAppContextText, claudeTurnsRef]
+  );
+
+  const handleSend = useCallback(() => {
+    const text = input.trim();
+    if (!text || chatting) return;
+    setInput("");
+    void processUserMessage(text);
+  }, [input, chatting, processUserMessage]);
+
+  const toggleMic = useCallback(() => {
+    if (listening) {
+      listenStopRef.current?.();
+      listenStopRef.current = null;
+      setListening(false);
+      setLiveTranscript("");
       return;
     }
-
-    // ── Chat mode: help only, no grading ──
-    if (pendingItem) {
-      // User typed something while a question is shown — provide guidance, not a grade
-      const item = pendingItem;
-      const hint = hintFor(item, text);
-      const skillName = skills().find(s => s.id === item.skillId)?.name || item.skillId;
-
-      let guidance = `💡 **On what you wrote:** "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"\n\n`;
-      guidance += `Practice focus: **${skillName}** (hints never include the scored answer).\n\n`;
-      guidance += `${hint}\n\n`;
-      guidance += `Type **skip** for a new question, or keep discussing!`;
-
-      addMsg("tutor", guidance, "hint");
-    } else {
-      // No pending question — general help
-      addMsg("tutor", "I'm here to help! Type **quiz** to see a practice question, or ask me about a concept. You can also upload an image or set context to discuss specific material.", "info");
-    }
-  }, [input, pendingItem, lastSkill, lastReason, addMsg, askNext, persist, onBack]);
+    if (chatting) return;
+    setLiveTranscript("");
+    setListening(true);
+    const { stop } = startListening({
+      onInterim: (preview) => setLiveTranscript(preview),
+      onFinal: (spoken) => {
+        setListening(false);
+        setLiveTranscript("");
+        listenStopRef.current = null;
+        if (spoken.trim()) void processUserMessage(spoken.trim(), { fromVoice: true });
+      },
+      onError: (msg) => {
+        setListening(false);
+        setLiveTranscript("");
+        listenStopRef.current = null;
+        addMsg("tutor", `🎤 ${msg}`, "hint");
+      },
+      onEnd: () => {
+        setListening(false);
+        listenStopRef.current = null;
+      },
+    });
+    listenStopRef.current = stop;
+  }, [chatting, listening, processUserMessage, addMsg]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -609,17 +952,29 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
           <MessageCircle className="w-5 h-5 text-primary" />
           <h2 className="font-semibold text-foreground">Chat Tutor</h2>
         </div>
+        <p className="text-xs text-muted-foreground max-w-[14rem] hidden sm:block">
+          The tutor only receives plain text — what you type or what the mic transcribes. No audio upload.
+        </p>
         <div className="flex gap-2">
-          {ttsAvailable && (
-            <Button
-              onClick={() => { setTtsEnabled(!ttsEnabled); if (ttsEnabled) stopSpeaking(); }}
-              variant="ghost" size="sm"
-              className={`gap-1 ${ttsEnabled ? "text-primary" : "text-muted-foreground"}`}
-            >
-              {ttsEnabled ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
-              {ttsEnabled ? "TTS On" : "TTS Off"}
-            </Button>
-          )}
+          <Button
+            onClick={() => {
+              if (!ttsAvailable) return;
+              if (ttsEnabled) stopSpeaking();
+              onTtsEnabledChange(!ttsEnabled);
+            }}
+            variant="ghost"
+            size="sm"
+            disabled={!ttsAvailable}
+            title={
+              ttsAvailable
+                ? "Read tutor lines aloud"
+                : "TTS unavailable in this browser (try Chrome on desktop)."
+            }
+            className={`gap-1 ${ttsEnabled && ttsAvailable ? "text-primary" : "text-muted-foreground"}`}
+          >
+            {ttsEnabled && ttsAvailable ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
+            {ttsEnabled && ttsAvailable ? "TTS On" : "TTS Off"}
+          </Button>
           <Button onClick={onReport} variant="ghost" size="sm" className="gap-1">
             <BarChart3 className="w-3 h-3" /> Report
           </Button>
@@ -662,27 +1017,50 @@ function ChatView({ store, persist, onBack, onReport, rewriteInstruction, onRewr
           </div>
           <div className="flex gap-2">
             <Input
-              placeholder={contextText ? "Answer (context active 📎)…" : "Type your answer or a command…"}
+              placeholder={appContextText ? "Answer (context active 📎)…" : "Type or speak your message…"}
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && handleSend()}
+              onKeyDown={e => e.key === "Enter" && !e.shiftKey && handleSend()}
               autoFocus
               className="h-11 font-mono flex-1"
+              disabled={chatting}
             />
             <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
             <Button variant="outline" size="icon" className="h-11 w-11 shrink-0"
-              onClick={() => fileInputRef.current?.click()} title="Upload image for context">
+              onClick={() => fileInputRef.current?.click()} title="Upload image for context" disabled={chatting}>
               <ImageIcon className="w-4 h-4" />
             </Button>
-            <Button onClick={handleSend} disabled={!input.trim()} className="h-11 px-4">
+            {sttAvailable && (
+              <Button
+                variant={listening ? "default" : "outline"}
+                size="icon"
+                className="h-11 w-11 shrink-0"
+                title={listening ? "Stop listening" : "Speak — text is sent to the tutor"}
+                onClick={toggleMic}
+                disabled={chatting}
+              >
+                <Mic className="w-4 h-4" />
+              </Button>
+            )}
+            <Button onClick={handleSend} disabled={!input.trim() || chatting} className="h-11 px-4">
               <Send className="w-4 h-4" />
             </Button>
           </div>
-          {contextText && (
+          {(listening || liveTranscript) && (
+            <p className="text-xs text-muted-foreground">
+              {listening ? <span className="text-primary animate-pulse">Listening… </span> : null}
+              {liveTranscript ? <span className="font-mono">{liveTranscript}</span> : null}
+            </p>
+          )}
+          {appContextText && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <span>📎 Context active</span>
               <Button variant="ghost" size="sm" className="h-5 text-xs px-1"
-                onClick={() => { setContextText(null); addMsg("tutor", "Context cleared.", "info"); }}>
+                onClick={() => {
+                  setAppContextText(null);
+                  claudeTurnsRef.current = [];
+                  addMsg("tutor", "Context cleared.", "info");
+                }}>
                 <X className="w-3 h-3" /> Clear
               </Button>
             </div>
@@ -706,11 +1084,24 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   };
 
   if (isUser) {
+    const preview =
+      message.text.length > 220 ? `${message.text.slice(0, 220)}…` : message.text;
     return (
-      <div className="flex justify-end">
+      <div className="flex flex-col items-end gap-1">
         <div className="max-w-[80%] rounded-2xl rounded-br-md bg-primary text-primary-foreground px-4 py-2.5 text-sm">
           {message.text}
         </div>
+        {message.viaVoice && (
+          <p
+            className="max-w-[85%] text-right text-[10px] leading-snug text-muted-foreground"
+            title={message.text}
+          >
+            <span className="font-medium text-muted-foreground/90">Transcript sent to tutor</span>
+            <span className="text-muted-foreground/70"> (plain text, not audio):</span>
+            <br />
+            <span className="font-mono text-foreground/75">&ldquo;{preview}&rdquo;</span>
+          </p>
+        )}
       </div>
     );
   }
@@ -754,10 +1145,57 @@ function SessionView({ session, answer, setAnswer, onSubmit, onQuit, store, judg
   const item = session.currentItem!;
   const hasFeedback = session.feedback !== null;
   const [hint, setHint] = useState<string | null>(null);
+  const ttsOk = detectTTS().backend !== null;
+  const sttOk = detectSTT().supported;
+  const [dictating, setDictating] = useState(false);
+  const dictationStopRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     setHint(null);
   }, [item.id]);
+
+  useEffect(() => {
+    return () => {
+      dictationStopRef.current?.();
+      dictationStopRef.current = null;
+    };
+  }, []);
+
+  const readQuestionAloud = () => {
+    speak(getQuizPromptText(item.prompt));
+  };
+
+  const toggleAnswerMic = () => {
+    if (judging) return;
+    if (dictating) {
+      dictationStopRef.current?.();
+      dictationStopRef.current = null;
+      setDictating(false);
+      return;
+    }
+    setDictating(true);
+    const { stop } = startListening({
+      onFinal: (t) => {
+        dictationStopRef.current = null;
+        setDictating(false);
+        const spoken = t.trim();
+        if (!spoken) return;
+        setAnswer(prev => {
+          const next = prev ? `${prev} ${spoken}` : spoken;
+          return next.trim();
+        });
+      },
+      onError: () => {
+        dictationStopRef.current = null;
+        setDictating(false);
+      },
+      onEnd: () => {
+        dictationStopRef.current = null;
+        setDictating(false);
+      },
+    });
+    dictationStopRef.current = stop;
+  };
   const tierColors: Record<string, string> = {
     A: "bg-tier-a text-primary-foreground",
     B: "bg-tier-b text-primary-foreground",
@@ -797,18 +1235,36 @@ function SessionView({ session, answer, setAnswer, onSubmit, onQuit, store, judg
       <div className="w-full max-w-xl space-y-6">
         <h2 className="text-2xl font-bold text-foreground">Quiz Question</h2>
         <p className="text-base text-foreground whitespace-pre-line">{getQuizPromptText(item.prompt)}</p>
+        {ttsOk && (
+          <Button type="button" variant="outline" size="sm" onClick={readQuestionAloud} className="gap-1.5">
+            <Volume2 className="w-4 h-4" /> Read question aloud
+          </Button>
+        )}
 
         {!hasFeedback ? (
           <div className="space-y-4">
             <div className="flex gap-2">
               <Input
-                placeholder="Type your answer"
+                placeholder="Type or dictate your answer"
                 value={answer}
                 onChange={e => setAnswer(e.target.value)}
                 onKeyDown={e => e.key === "Enter" && answer.trim() && onSubmit()}
                 autoFocus
                 className="h-12 text-base flex-1"
               />
+              {sttOk && (
+                <Button
+                  type="button"
+                  variant={dictating ? "default" : "outline"}
+                  size="icon"
+                  className="h-12 w-12 shrink-0"
+                  title={dictating ? "Stop dictation" : "Dictate — text fills your answer"}
+                  onClick={toggleAnswerMic}
+                  disabled={judging}
+                >
+                  <Mic className="w-5 h-5" />
+                </Button>
+              )}
               <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
               <Button variant="outline" size="icon" className="h-12 w-12 shrink-0"
                 onClick={() => fileInputRef.current?.click()} disabled={scanning} title="Upload image">
@@ -873,6 +1329,19 @@ function SessionView({ session, answer, setAnswer, onSubmit, onQuit, store, judg
                 autoFocus
                 className="h-12 text-base flex-1"
               />
+              {sttOk && (
+                <Button
+                  type="button"
+                  variant={dictating ? "default" : "outline"}
+                  size="icon"
+                  className="h-12 w-12 shrink-0"
+                  title={dictating ? "Stop dictation" : "Dictate answer"}
+                  onClick={toggleAnswerMic}
+                  disabled={judging}
+                >
+                  <Mic className="w-5 h-5" />
+                </Button>
+              )}
             </div>
             <div className="flex gap-2">
               <Button onClick={onSubmit} disabled={!answer.trim() || judging} className="flex-1 h-11">
